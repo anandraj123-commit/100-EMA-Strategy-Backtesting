@@ -270,6 +270,10 @@
       <b>Fee guardrails:</b> trades are skipped if the signal-candle stop is tighter than the minimum stop percentage,
       if the risk-based position would require more than the maximum effective leverage, or if estimated entry+exit
       broker charges plus GST would exceed the configured percentage of the planned 1R risk amount.
+
+      <br><br>
+      <b>Important:</b> the Results panel now records the exact RR, risk %, fee, GST, minimum stop,
+      leverage cap and maximum fee/risk settings used in that backtest so different runs cannot be confused.
     </p>
   </div>
 
@@ -612,6 +616,14 @@ function runBacktest(candles, p) {
       shortWinRate: shortTrades.length ? shortTrades.filter(t => t.exitReason === 'TP').length / shortTrades.length * 100 : 0,
       totalGrossPnL, totalBrokerCharges, totalGST, totalCharges, netProfit,
       grossAvgR,
+      rrUsed: p.rr,
+      riskPctUsed: p.riskPct,
+      commissionPctUsed: p.commissionPct,
+      gstPctUsed: p.gstPct,
+      minStopPctUsed: p.minStopPct,
+      maxLeverageUsed: p.maxLeverage,
+      maxFeeRiskPctUsed: p.maxFeeRiskPct,
+      maxLossesPerDayUsed: p.maxLossesPerDay,
       tradesSkippedDueToLimit,
       tradesSkippedTightStop,
       tradesSkippedLeverage,
@@ -629,6 +641,14 @@ function fmtDate(unix) { return new Date(unix*1000).toISOString().replace('T',' 
 function renderStats(stats) {
   const grid = document.getElementById('statsGrid');
   const cells = [
+    ['RR Used', '1:'+fmt(stats.rrUsed,2), 'amber'],
+    ['Risk / Trade', fmt(stats.riskPctUsed,2)+'%', ''],
+    ['Broker Fee / Side', fmt(stats.commissionPctUsed,3)+'%', ''],
+    ['GST on Fee', fmt(stats.gstPctUsed,1)+'%', ''],
+    ['Min Stop', fmt(stats.minStopPctUsed,2)+'%', ''],
+    ['Max Effective Leverage', fmt(stats.maxLeverageUsed,2)+'x', ''],
+    ['Max Fee / Risk', fmt(stats.maxFeeRiskPctUsed,1)+'%', ''],
+    ['Daily Loss Limit', stats.maxLossesPerDayUsed, ''],
     ['Total Trades', stats.totalTrades, ''],
     ['Win Rate', fmt(stats.winRate,1)+'%', stats.winRate>=50?'pos':'neg'],
     ['Total Return', (stats.totalReturn>=0?'+':'')+fmt(stats.totalReturn,2)+'%', stats.totalReturn>=0?'pos':'neg'],
@@ -796,8 +816,8 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     renderEquityCurve(result.equityCurve);
     renderTradeLog(result.trades);
 
-    progressBar.style.width = '100%
-    progressText.textContent = `Done. ${candles.length.toLocaleString()} candles, ${result.trades.length} trades.`;
+    progressBar.style.width = '100%';
+    progressText.textContent = `Done. ${candles.length.toLocaleString()} candles, ${result.trades.length} trades. RR 1:${params.rr} · Risk ${params.riskPct}% · Max Lev ${params.maxLeverage}x · Min Stop ${params.minStopPct}% · Max Fee/Risk ${params.maxFeeRiskPct}%`;
   } catch (err) {
     showError(err.message || String(err));
     progressText.textContent = 'Failed — see error above.';
