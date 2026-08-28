@@ -190,7 +190,7 @@
       </div>
       <div>
         <label>Resolution</label>
-        <input type="text" id="resolution" value="5m" disabled>
+        <input type="text" id="resolution" value="5m">
       </div>
       <div>
         <label>Start Date</label>
@@ -255,8 +255,8 @@
     <div id="error-box"></div>
     <p class="hint">
       Fetches candles in 2,000-bar chunks (Delta Exchange's per-request cap) from <b>api.india.delta.exchange</b>,
-      falling back to <b>api.delta.exchange</b> if the first is unreachable. 5 years of 5m data is ~260 requests —
-      this can take a few minutes. If every request fails, your browser is likely blocking the request via CORS;
+      falling back to <b>api.delta.exchange</b> if the first is unreachable. The selected resolution is used automatically
+      for pagination, so you can test the same strategy on different timeframes. If every request fails, your browser is likely blocking the request via CORS;
       try a different network, a CORS-friendly proxy, or run this file through a local dev server instead of opening it directly as a file.
       <br><br>
       <b>Charges:</b> broker charge is applied on both the entry and exit leg of every trade; GST is then applied on top of that
@@ -319,9 +319,31 @@ let cancelRequested = false;
 
 // ============================================================
 // DATA FETCH: Delta Exchange history/candles, paginated
+// Resolution is fully dynamic — no timeframe is hard-coded.
 // ============================================================
+function resolutionToSeconds(resolution) {
+  const value = String(resolution || '').trim().toLowerCase();
+  const match = value.match(/^(\d+)(s|m|h|d|w)$/);
+  if (!match) {
+    throw new Error(`Unsupported resolution "${resolution}". Use values such as 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d.`);
+  }
+
+  const amount = Number(match[1]);
+  const unit = match[2];
+  const multipliers = {
+    s: 1,
+    m: 60,
+    h: 60 * 60,
+    d: 24 * 60 * 60,
+    w: 7 * 24 * 60 * 60
+  };
+
+  return amount * multipliers[unit];
+}
+
 async function fetchCandles(symbol, resolution, startUnix, endUnix, onProgress) {
-  const chunkSeconds = 2000 * 5 * 60; // 2000 candles * 5min
+  const candleSeconds = resolutionToSeconds(resolution);
+  const chunkSeconds = 2000 * candleSeconds; // Delta cap: 2,000 candles/request
   const bases = ['https://api.india.delta.exchange', 'https://api.delta.exchange'];
   let candles = [];
   let cursor = startUnix;
@@ -833,3 +855,4 @@ document.getElementById('cancelBtn').addEventListener('click', () => {
 </script>
 </body>
 </html>
+ 
