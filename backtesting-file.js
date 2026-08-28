@@ -209,6 +209,10 @@
         <input type="number" id="slopeLookback" value="3">
       </div>
       <div>
+        <label>Entry Valid For Next Candles</label>
+        <input type="number" id="entryValidCandles" value="2" step="1" min="1">
+      </div>
+      <div>
         <label>Risk:Reward Ratio</label>
         <input type="number" id="rr" value="3" step="0.5">
       </div>
@@ -429,8 +433,8 @@ function runBacktest(candles, p) {
   const equityCurve = [{ time: candles[Math.min(warmup, candles.length-1)] ? candles[warmup].time : candles[0].time, equity }];
   const trades = [];
 
-  let pendingBuyTrigger = null, pendingBuySL = null;
-  let pendingSellTrigger = null, pendingSellSL = null;
+  let pendingBuyTrigger = null, pendingBuySL = null, pendingBuySignalIndex = null;
+  let pendingSellTrigger = null, pendingSellSL = null, pendingSellSignalIndex = null;
   let inTrade = false, tradeDir = null, entryPrice = null, slPrice = null, tpPrice = null, entryTime = null;
 
   let currentDay = null;
@@ -451,8 +455,8 @@ function runBacktest(candles, p) {
       dailyLossStreak = 0;
       dayBlocked = false;
       if (!inTrade) {
-        pendingBuyTrigger = null; pendingBuySL = null;
-        pendingSellTrigger = null; pendingSellSL = null;
+        pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
+        pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
       }
     }
 
@@ -471,14 +475,24 @@ function runBacktest(candles, p) {
     const sellPatternB = c.open < e && c.close < e && c.high > e;
     const sellSignalCandle = trendDown && (sellPatternA || sellPatternB);
 
-    if (!inTrade && !dayBlocked) {
-      if (buySignalCandle) {
-        pendingBuyTrigger = c.high; pendingBuySL = c.low;
-        pendingSellTrigger = null; pendingSellSL = null;
+    // --- Pending signal is valid only for the configured number of candles after the signal candle ---
+    if (!inTrade) {
+      if (pendingBuySignalIndex != null && i - pendingBuySignalIndex > p.entryValidCandles) {
+        pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
       }
-      if (sellSignalCandle) {
-        pendingSellTrigger = c.low; pendingSellSL = c.high;
-        pendingBuyTrigger = null; pendingBuySL = null;
+      if (pendingSellSignalIndex != null && i - pendingSellSignalIndex > p.entryValidCandles) {
+        pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
+      }
+    }
+
+    if (!inTrade && !dayBlocked) {
+      const hasPendingSignal = pendingBuyTrigger != null || pendingSellTrigger != null;
+      if (!hasPendingSignal && buySignalCandle) {
+        pendingBuyTrigger = c.high; pendingBuySL = c.low; pendingBuySignalIndex = i;
+        pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
+      } else if (!hasPendingSignal && sellSignalCandle) {
+        pendingSellTrigger = c.low; pendingSellSL = c.high; pendingSellSignalIndex = i;
+        pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
       }
     } else if (!inTrade && dayBlocked && (buySignalCandle || sellSignalCandle)) {
       tradesSkippedDueToLimit++;
@@ -514,7 +528,7 @@ function runBacktest(candles, p) {
         entryTime = c.time;
       }
 
-      pendingBuyTrigger = null; pendingBuySL = null;
+      pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
     } else if (!inTrade && !dayBlocked && pendingSellTrigger != null && c.low < pendingSellTrigger) {
       const candidateEntry = pendingSellTrigger;
       const candidateSL = pendingSellSL;
@@ -545,7 +559,7 @@ function runBacktest(candles, p) {
         entryTime = c.time;
       }
 
-      pendingSellTrigger = null; pendingSellSL = null;
+      pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
     }
 
     if (inTrade) {
@@ -803,6 +817,7 @@ document.getElementById('runBtn').addEventListener('click', async () => {
   const params = {
     emaLen: parseInt(document.getElementById('emaLen').value, 10),
     slopeLookback: parseInt(document.getElementById('slopeLookback').value, 10),
+    entryValidCandles: Math.max(1, parseInt(document.getElementById('entryValidCandles').value, 10) || 2),
     rr: parseFloat(document.getElementById('rr').value),
     riskPct: parseFloat(document.getElementById('riskPct').value),
     startCapital: parseFloat(document.getElementById('startCapital').value),
