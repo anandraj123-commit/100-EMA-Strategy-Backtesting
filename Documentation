@@ -1,0 +1,370 @@
+Yes. Here is the exact backtesting flow we are implementing.
+
+1. 5-minute candles decide the strategy
+
+Your main strategy still runs on 5-minute candles.
+
+For every completed 5m candle we calculate the EMA and determine its direction.
+
+For a BUY signal:
+
+EMA trend = UP
+
+Pattern A:
+Open < EMA
+Close > EMA
+
+OR
+
+Pattern B:
+Open > EMA
+Close > EMA
+Low <= EMA
+
+For a SELL signal:
+
+EMA trend = DOWN
+
+Pattern A:
+Open > EMA
+Close < EMA
+
+OR
+
+Pattern B:
+Open < EMA
+Close < EMA
+High >= EMA
+
+Nothing about the signal-generation strategy was changed.
+
+2. Signal candle becomes T0
+
+Suppose a BUY signal forms:
+
+T0 5m candle
+
+High = 105  ← BUY trigger
+Low  = 98   ← Stop Loss
+
+We cannot enter on T0 itself.
+
+The pending setup becomes:
+
+BUY above 105
+SL = 98
+3. Entry Valid For Next Candles controls how long we wait
+
+Suppose:
+
+Entry Valid For Next Candles = 2
+
+Then:
+
+T0 = Signal candle       ❌ cannot enter
+T1 = First valid candle  ✅
+T2 = Second valid candle ✅
+T3 = Expired             ❌
+
+So 1-minute processing does NOT mean the setup stays valid longer.
+
+4. A 5m breakout is only the first check
+
+Suppose T1 has:
+
+Open = 103
+High = 108
+Low  = 97
+Close = 106
+
+Because:
+
+108 > BUY trigger 105
+
+the 5m candle tells us that the trigger was crossed.
+
+But it cannot tell us when 105 was crossed relative to the movement toward 98.
+
+Therefore we inspect T1's 1-minute candles.
+
+5. Find the actual entry using 1m candles
+
+Imagine T1 consists of:
+
+1m #1: High 104
+1m #2: High 104.8
+1m #3: High 106  ← first high > 105
+1m #4
+1m #5
+
+Entry occurs on:
+
+1m #3
+Entry price = 105
+
+For SELL, it is the opposite:
+
+1m low < SELL trigger
+6. Your special rule for the entry minute
+
+This is particularly important.
+
+Suppose BUY:
+
+Trigger = 105
+SL = 98
+
+And the entry 1m candle is:
+
+High = 106
+Low  = 97
+
+That same minute contains both:
+
+Entry trigger crossed
+AND
+SL crossed
+
+With OHLC data, we don't know whether price went:
+
+105 → 106 → 98
+
+or:
+
+98 → 105 → 106
+
+Your chosen rule is:
+
+TAKE THE ENTRY.
+
+Do NOT check SL or TP
+on the entry 1-minute candle.
+
+Therefore the trade is not stopped out on that minute.
+
+7. Protection begins from the NEXT 1m candle
+
+Suppose entry happened at:
+
+10:02
+
+Then:
+
+10:02 → entry
+        SL/TP ignored
+
+10:03 → SL/TP active
+10:04 → SL/TP active
+...
+
+This applies even though 10:03 and 10:04 are still inside the same 5m candle.
+
+8. Normal later candles are inexpensive to process
+
+Suppose a later 5m candle has:
+
+SL = 98
+TP = 126
+
+If its range is:
+
+Low = 101
+High = 120
+
+neither is reached → continue.
+
+If:
+
+Low = 97
+High = 120
+
+only SL is reached → SL.
+
+If:
+
+Low = 101
+High = 127
+
+only TP is reached → TP.
+
+We don't need 1m analysis for those cases because there is no ambiguity.
+
+9. If BOTH SL and TP occur in a later 5m candle
+
+This is the part we corrected in the latest version.
+
+Suppose:
+
+SL = 98
+TP = 126
+
+5m:
+Low  = 97
+High = 128
+
+Both were touched somewhere within those five minutes.
+
+We do not automatically choose SL.
+
+Instead, inspect the 1m candles chronologically.
+
+Example:
+
+10:15  100–110
+10:16  103–120
+10:17  105–127  ← TP
+10:18   97–108  ← SL
+10:19
+
+TP occurred first.
+
+Result:
+
+TP ✅
+
+If instead:
+
+10:15  100–110
+10:16   97–108  ← SL
+10:17  105–127  ← TP
+
+Result:
+
+SL ❌
+10. What if the SAME later 1m candle contains SL and TP?
+
+Example:
+
+SL = 98
+TP = 126
+
+1m:
+Low  = 97
+High = 128
+
+Even 1m OHLC cannot tell which happened first.
+
+So we use the agreed conservative rule:
+
+Both inside same 1m
+        ↓
+       SL
+11. What if 5m says breakout but 1m doesn't confirm it?
+
+We do not invent the entry.
+
+For example:
+
+T1 5m high = 106
+Trigger = 105
+
+but available T1 1m data
+never shows high > 105
+
+No confirmed entry is created from T1.
+
+And importantly, if:
+
+Entry Valid = 2
+
+T2 is still allowed.
+
+So:
+
+T0 → signal
+
+T1 → 5m breakout
+     but no reliable 1m confirmation
+     → NO fabricated trade
+     → setup remains pending
+
+T2 → valid 5m + 1m breakout
+     → ENTER
+
+T3 → too late
+12. Optimizer uses exactly the same execution logic
+
+The optimizer isn't supposed to use a simplified version of the strategy.
+
+Every parameter combination goes through the same:
+
+5m signal
+    ↓
+Entry-valid window
+    ↓
+5m breakout
+    ↓
+1m entry confirmation
+    ↓
+Ignore entry-minute SL/TP
+    ↓
+Protection from next minute
+    ↓
+Later 5m SL/TP
+    ↓
+If both → inspect 1m
+13. Performance improvement
+
+We don't rebuild millions of 1m candles for every optimizer trial.
+
+Instead:
+
+Fetch 1m candles
+       ↓
+Build 1m lookup ONCE
+       ↓
+Trial 1 ─┐
+Trial 2  │
+Trial 3  ├→ same lookup
+...      │
+Trial N ─┘
+
+That was one of the major performance fixes.
+
+In one diagram
+                 5-MINUTE STRATEGY
+                        │
+                 EMA + Pattern
+                        │
+                       T0
+                        │
+                Create pending setup
+                        │
+          ┌─────────────┴─────────────┐
+          │ Entry Valid Next Candles │
+          │       T1, T2, ...         │
+          └─────────────┬─────────────┘
+                        │
+                 5m trigger breaks?
+                        │
+                       YES
+                        ↓
+                 CHECK 1-MINUTE
+                        │
+                 Trigger confirmed?
+                        │
+                       YES
+                        ↓
+                      ENTRY
+                        │
+          Ignore SL/TP on entry 1m
+                        │
+                        ↓
+              NEXT 1m → protection ON
+                        │
+                        ↓
+                Later 5m candles
+                        │
+          ┌─────────────┼─────────────┐
+       SL only       TP only       Both
+          │             │             │
+         SL            TP        CHECK 1m
+                                      │
+                              ┌───────┴───────┐
+                           SL first       TP first
+                              │               │
+                             SL              TP
+
+                    Same 1m has both
+                              ↓
+                             SL
