@@ -842,15 +842,16 @@ function runBacktest(candles, p, oneMinuteByParent = new Map()) {
         const tpTouched = tradeDir === 'long' ? c.high >= tpPrice : c.low <= tpPrice;
 
         if (slTouched && tpTouched) {
-          const mins = oneMinuteByParent.get(c.time) || [];
+          // Reuse the same strict completeness check used for entry confirmation.
+          // This avoids relying on an out-of-scope parentSec variable and also verifies
+          // that every expected 1m timestamp exists inside this strategy candle.
+          const mins = getCompleteExecutionMinutes(
+            oneMinuteByParent,
+            c.time,
+            p.strategyResolutionSeconds
+          );
 
-          // Only use 1m ordering when the complete strategy-candle minute set is
-          // available. If it is incomplete, keep the deterministic conservative
-          // fallback (SL first) rather than inventing a favorable sequence.
-          const expectedMinutes = Math.max(1, Math.round(parentSec / 60));
-          const completeMinutes = mins.length >= expectedMinutes;
-
-          if (completeMinutes) {
+          if (mins) {
             for (const m of mins) {
               const minuteSL = tradeDir === 'long' ? m.low <= slPrice : m.high >= slPrice;
               const minuteTP = tradeDir === 'long' ? m.high >= tpPrice : m.low <= tpPrice;
