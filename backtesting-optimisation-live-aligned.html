@@ -220,7 +220,6 @@
 </head>
 <body>
 <div class="wrap">
-
   <header>
     <h1>BTCUSD<span> // 5M SIGNAL · 1M EXECUTION BACKTESTER</span></h1>
     <div class="status-line"><span class="dot"></span>DATA SOURCE: DELTA EXCHANGE API</div>
@@ -328,7 +327,7 @@
       <b>Important:</b> the Results panel now records the exact RR, risk %, fee, GST, minimum stop,
       leverage cap and maximum fee/risk settings used in that backtest so different runs cannot be confused.
       <br><br>
-      <b>Intrabar execution:</b> BUY-B uses low &lt;= EMA and SELL-B uses high &gt;= EMA; T0 cannot self-trigger. When a later strategy candle breaks the trigger, its 1-minute candles are processed chronologically. The first 1m candle that breaks the trigger creates the entry at the trigger price. SL/TP are deliberately ignored on that same 1m entry candle; protection starts from the next 1m candle, including later 1m candles inside the same strategy candle. If a later 1m candle contains both SL and TP, SL wins.
+      <b>Intrabar execution:</b> BUY-B uses low &lt;= EMA and SELL-B uses high &gt;= EMA; T0 cannot self-trigger. When a later strategy candle breaks the trigger, its 1-minute candles are processed chronologically. The first 1m candle that breaks the trigger creates the entry at the trigger price. SL/TP are deliberately ignored on that same 1m entry candle; protection starts from the next 1m candle, including later 1m candles inside the same strategy candle. For later strategy candles, 1m candles resolve SL-vs-TP when both levels are reachable; if both occur inside the same 1m candle, SL wins.
     </p>
   </div>
 
@@ -607,16 +606,47 @@ function computeEMA(closes, length) {
 // ============================================================
 // STRATEGY SIMULATION (aligned to the live bot rules used by this project)
 // ============================================================
-function runBacktest(candles, p, oneMinuteCandles = []) {
-  // 1m candles are execution-only. They never create EMA signals.
+function buildOneMinuteIndex(oneMinuteCandles, strategyResolutionSeconds) {
+  const parentSec = strategyResolutionSeconds || 300;
   const oneMinuteByParent = new Map();
-  const parentSec = p.strategyResolutionSeconds || 300;
+
   for (const m of oneMinuteCandles) {
     const parentTime = Math.floor(m.time / parentSec) * parentSec;
-    if (!oneMinuteByParent.has(parentTime)) oneMinuteByParent.set(parentTime, []);
-    oneMinuteByParent.get(parentTime).push(m);
+    let arr = oneMinuteByParent.get(parentTime);
+    if (!arr) {
+      arr = [];
+      oneMinuteByParent.set(parentTime, arr);
+    }
+    arr.push(m);
   }
-  for (const arr of oneMinuteByParent.values()) arr.sort((a,b) => a.time - b.time);
+
+  for (const arr of oneMinuteByParent.values()) arr.sort((a, b) => a.time - b.time);
+  return oneMinuteByParent;
+}
+
+function getCompleteExecutionMinutes(oneMinuteByParent, strategyCandleTime, strategyResolutionSeconds) {
+  const parentSec = strategyResolutionSeconds || 300;
+  const expectedCount = parentSec / 60;
+  if (!Number.isInteger(expectedCount) || expectedCount < 1) return null;
+
+  const mins = oneMinuteByParent.get(strategyCandleTime);
+  if (!mins || mins.length < expectedCount) return null;
+
+  // Require exactly the chronological 1m slots belonging to this strategy candle.
+  // Extra duplicate/out-of-window records are ignored only after timestamp matching.
+  const byTime = new Map(mins.map(m => [Number(m.time), m]));
+  const complete = [];
+  for (let offset = 0; offset < parentSec; offset += 60) {
+    const m = byTime.get(strategyCandleTime + offset);
+    if (!m) return null;
+    complete.push(m);
+  }
+  return complete;
+}
+
+function runBacktest(candles, p, oneMinuteByParent = new Map()) {
+  // Strategy signals are generated only from strategy-timeframe candles.
+  // The prebuilt 1m index is execution-only and is reused across optimizer trials.
   const closes = candles.map(c => c.close);
   const ema = computeEMA(closes, p.emaLen);
   const warmup = p.emaLen + p.slopeLookback + 2;
@@ -631,7 +661,7 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
   let pendingBuyTrigger = null, pendingBuySL = null, pendingBuySignalIndex = null;
   let pendingSellTrigger = null, pendingSellSL = null, pendingSellSignalIndex = null;
   let inTrade = false, tradeDir = null, entryPrice = null, slPrice = null, tpPrice = null, entryTime = null;
-  let entryBarIndex = null;
+  let entryBarIndex = null, entryMinuteIndex = null, entryMinutes = null;
 
   let currentDay = null;
   let dailyLossStreak = 0;
@@ -640,12 +670,12 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
   let tradesSkippedTightStop = 0;
   let tradesSkippedLeverage = 0;
   let tradesSkippedFees = 0;
+  let entryAttemptsMissing1m = 0;
+  let entryAttempts1mMismatch = 0;
 
   for (let i = warmup; i < candles.length; i++) {
     const c = candles[i];
 
-    // --- Day rollover: live behavior resets only the daily loss lock.
-    // A still-valid pending setup is NOT discarded merely because UTC midnight passed. ---
     const day = Math.floor(c.time / 86400);
     if (day !== currentDay) {
       currentDay = day;
@@ -668,7 +698,8 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
     const sellPatternB = c.open < e && c.close < e && c.high >= e;
     const sellSignalCandle = trendDown && (sellPatternA || sellPatternB);
 
-    // --- Pending signal is valid only for the configured number of candles after the signal candle ---
+    // Entry Valid For Next Candles is controlled ONLY by strategy candles.
+    // T0 cannot enter. With value=2, T1 and T2 are eligible; T3 is expired.
     if (!inTrade) {
       if (pendingBuySignalIndex != null && i - pendingBuySignalIndex > p.entryValidCandles) {
         pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
@@ -691,100 +722,109 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
       tradesSkippedDueToLimit++;
     }
 
+    // BUY: a strategy candle must break the trigger, then complete 1m data must confirm
+    // the first strict trigger break. Missing/mismatched 1m data does NOT fabricate an
+    // entry and does NOT consume the setup while another Entry Valid candle remains.
     if (!inTrade && !dayBlocked && pendingBuyTrigger != null && i > pendingBuySignalIndex && c.high > pendingBuyTrigger) {
       const candidateEntry = pendingBuyTrigger;
       const candidateSL = pendingBuySL;
-      const stopDistance = Math.abs(candidateEntry - candidateSL);
-      const stopPct = candidateEntry > 0 ? (stopDistance / candidateEntry) * 100 : 0;
-      const riskAmount = equity * (p.riskPct / 100);
-      const riskBasedQty = stopDistance > 0 ? riskAmount / stopDistance : 0;
-      const riskBasedNotional = riskBasedQty * candidateEntry;
-      const effectiveLeverage = equity > 0 ? riskBasedNotional / equity : Infinity;
-      const candidateTP = candidateEntry + stopDistance * p.rr;
-      const estimatedEntryNotional = riskBasedNotional;
-      const estimatedExitNotional = riskBasedQty * candidateTP;
-      const estimatedBrokerCharge = (estimatedEntryNotional + estimatedExitNotional) * (p.commissionPct / 100);
-      const estimatedGST = estimatedBrokerCharge * (p.gstPct / 100);
-      const estimatedTotalCharges = estimatedBrokerCharge + estimatedGST;
-      const feeRiskPct = riskAmount > 0 ? (estimatedTotalCharges / riskAmount) * 100 : Infinity;
+      const mins = getCompleteExecutionMinutes(oneMinuteByParent, c.time, p.strategyResolutionSeconds);
 
-      if (stopPct < p.minStopPct) {
-        tradesSkippedTightStop++;
-      } else if (effectiveLeverage > p.maxLeverage) {
-        tradesSkippedLeverage++;
-      } else if (feeRiskPct > p.maxFeeRiskPct) {
-        tradesSkippedFees++;
+      if (!mins) {
+        entryAttemptsMissing1m++;
       } else {
-        inTrade = true; tradeDir = 'long';
-        entryPrice = candidateEntry; slPrice = candidateSL;
-        tpPrice = candidateTP;
-        entryTime = c.time;
-        entryBarIndex = i;
+        const confirmedEntryMinuteIndex = mins.findIndex(m => m.high > candidateEntry);
+        if (confirmedEntryMinuteIndex < 0) {
+          entryAttempts1mMismatch++;
+        } else {
+          const stopDistance = Math.abs(candidateEntry - candidateSL);
+          const stopPct = candidateEntry > 0 ? (stopDistance / candidateEntry) * 100 : 0;
+          const riskAmount = equity * (p.riskPct / 100);
+          const riskBasedQty = stopDistance > 0 ? riskAmount / stopDistance : 0;
+          const riskBasedNotional = riskBasedQty * candidateEntry;
+          const effectiveLeverage = equity > 0 ? riskBasedNotional / equity : Infinity;
+          const candidateTP = candidateEntry + stopDistance * p.rr;
+          const estimatedEntryNotional = riskBasedNotional;
+          const estimatedExitNotional = riskBasedQty * candidateTP;
+          const estimatedBrokerCharge = (estimatedEntryNotional + estimatedExitNotional) * (p.commissionPct / 100);
+          const estimatedGST = estimatedBrokerCharge * (p.gstPct / 100);
+          const estimatedTotalCharges = estimatedBrokerCharge + estimatedGST;
+          const feeRiskPct = riskAmount > 0 ? (estimatedTotalCharges / riskAmount) * 100 : Infinity;
 
-        // Resolve the entry candle with 1m data. The 1m candle that first
-        // breaks the trigger creates the entry, but its own SL/TP range is ignored.
-        const mins = oneMinuteByParent.get(c.time) || [];
-        const entryMinuteIndex = mins.findIndex(m => m.high > candidateEntry);
-        if (entryMinuteIndex >= 0) entryTime = mins[entryMinuteIndex].time;
+          // A confirmed breakout consumes the setup even if an execution/risk guard rejects it.
+          if (stopPct < p.minStopPct) {
+            tradesSkippedTightStop++;
+          } else if (effectiveLeverage > p.maxLeverage) {
+            tradesSkippedLeverage++;
+          } else if (feeRiskPct > p.maxFeeRiskPct) {
+            tradesSkippedFees++;
+          } else {
+            inTrade = true; tradeDir = 'long';
+            entryPrice = candidateEntry; slPrice = candidateSL; tpPrice = candidateTP;
+            entryTime = mins[confirmedEntryMinuteIndex].time;
+            entryBarIndex = i;
+            entryMinuteIndex = confirmedEntryMinuteIndex;
+            entryMinutes = mins;
+          }
+
+          pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
+        }
       }
-
-      pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
     } else if (!inTrade && !dayBlocked && pendingSellTrigger != null && i > pendingSellSignalIndex && c.low < pendingSellTrigger) {
       const candidateEntry = pendingSellTrigger;
       const candidateSL = pendingSellSL;
-      const stopDistance = Math.abs(candidateEntry - candidateSL);
-      const stopPct = candidateEntry > 0 ? (stopDistance / candidateEntry) * 100 : 0;
-      const riskAmount = equity * (p.riskPct / 100);
-      const riskBasedQty = stopDistance > 0 ? riskAmount / stopDistance : 0;
-      const riskBasedNotional = riskBasedQty * candidateEntry;
-      const effectiveLeverage = equity > 0 ? riskBasedNotional / equity : Infinity;
-      const candidateTP = candidateEntry - stopDistance * p.rr;
-      const estimatedEntryNotional = riskBasedNotional;
-      const estimatedExitNotional = riskBasedQty * candidateTP;
-      const estimatedBrokerCharge = (estimatedEntryNotional + estimatedExitNotional) * (p.commissionPct / 100);
-      const estimatedGST = estimatedBrokerCharge * (p.gstPct / 100);
-      const estimatedTotalCharges = estimatedBrokerCharge + estimatedGST;
-      const feeRiskPct = riskAmount > 0 ? (estimatedTotalCharges / riskAmount) * 100 : Infinity;
+      const mins = getCompleteExecutionMinutes(oneMinuteByParent, c.time, p.strategyResolutionSeconds);
 
-      if (stopPct < p.minStopPct) {
-        tradesSkippedTightStop++;
-      } else if (effectiveLeverage > p.maxLeverage) {
-        tradesSkippedLeverage++;
-      } else if (feeRiskPct > p.maxFeeRiskPct) {
-        tradesSkippedFees++;
+      if (!mins) {
+        entryAttemptsMissing1m++;
       } else {
-        inTrade = true; tradeDir = 'short';
-        entryPrice = candidateEntry; slPrice = candidateSL;
-        tpPrice = candidateTP;
-        entryTime = c.time;
-        entryBarIndex = i;
+        const confirmedEntryMinuteIndex = mins.findIndex(m => m.low < candidateEntry);
+        if (confirmedEntryMinuteIndex < 0) {
+          entryAttempts1mMismatch++;
+        } else {
+          const stopDistance = Math.abs(candidateEntry - candidateSL);
+          const stopPct = candidateEntry > 0 ? (stopDistance / candidateEntry) * 100 : 0;
+          const riskAmount = equity * (p.riskPct / 100);
+          const riskBasedQty = stopDistance > 0 ? riskAmount / stopDistance : 0;
+          const riskBasedNotional = riskBasedQty * candidateEntry;
+          const effectiveLeverage = equity > 0 ? riskBasedNotional / equity : Infinity;
+          const candidateTP = candidateEntry - stopDistance * p.rr;
+          const estimatedEntryNotional = riskBasedNotional;
+          const estimatedExitNotional = riskBasedQty * candidateTP;
+          const estimatedBrokerCharge = (estimatedEntryNotional + estimatedExitNotional) * (p.commissionPct / 100);
+          const estimatedGST = estimatedBrokerCharge * (p.gstPct / 100);
+          const estimatedTotalCharges = estimatedBrokerCharge + estimatedGST;
+          const feeRiskPct = riskAmount > 0 ? (estimatedTotalCharges / riskAmount) * 100 : Infinity;
 
-        // Resolve the entry candle with 1m data. The 1m candle that first
-        // breaks the trigger creates the entry, but its own SL/TP range is ignored.
-        const mins = oneMinuteByParent.get(c.time) || [];
-        const entryMinuteIndex = mins.findIndex(m => m.low < candidateEntry);
-        if (entryMinuteIndex >= 0) entryTime = mins[entryMinuteIndex].time;
+          if (stopPct < p.minStopPct) {
+            tradesSkippedTightStop++;
+          } else if (effectiveLeverage > p.maxLeverage) {
+            tradesSkippedLeverage++;
+          } else if (feeRiskPct > p.maxFeeRiskPct) {
+            tradesSkippedFees++;
+          } else {
+            inTrade = true; tradeDir = 'short';
+            entryPrice = candidateEntry; slPrice = candidateSL; tpPrice = candidateTP;
+            entryTime = mins[confirmedEntryMinuteIndex].time;
+            entryBarIndex = i;
+            entryMinuteIndex = confirmedEntryMinuteIndex;
+            entryMinutes = mins;
+          }
+
+          pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
+        }
       }
-
-      pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
     }
 
-    // Intrabar exit handling.
-    // On the strategy entry candle, use 1m candles and begin protection from
-    // the minute AFTER the entry minute. On later strategy candles, preserve
-    // the original conservative SL-first OHLC behavior.
+    // On the entry strategy candle, protection starts from the 1m candle AFTER
+    // the confirmed entry minute. Thus same-1m entry/SL ambiguity intentionally
+    // resolves as entry first, with SL/TP becoming active on the next 1m candle.
+    let exitReason = null, exitPrice = null, exitAt = null;
     if (inTrade) {
-      let exitReason = null, exitPrice = null, exitAt = null;
-
       if (entryBarIndex === i) {
-        const mins = oneMinuteByParent.get(c.time) || [];
-        let entryMinuteIndex = -1;
-        if (tradeDir === 'long') entryMinuteIndex = mins.findIndex(m => m.high > entryPrice);
-        else entryMinuteIndex = mins.findIndex(m => m.low < entryPrice);
-
-        if (entryMinuteIndex >= 0) {
-          for (let mi = entryMinuteIndex + 1; mi < mins.length; mi++) {
-            const m = mins[mi];
+        if (entryMinutes && entryMinuteIndex != null && entryMinuteIndex >= 0) {
+          for (let mi = entryMinuteIndex + 1; mi < entryMinutes.length; mi++) {
+            const m = entryMinutes[mi];
             if (tradeDir === 'long') {
               if (m.low <= slPrice) { exitReason = 'SL'; exitPrice = slPrice; exitAt = m.time; break; }
               if (m.high >= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; exitAt = m.time; break; }
@@ -795,14 +835,50 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
           }
         }
       } else if (entryBarIndex == null || i > entryBarIndex) {
-        if (tradeDir === 'long') {
-          if (c.low <= slPrice) { exitReason = 'SL'; exitPrice = slPrice; }
-          else if (c.high >= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; }
-        } else {
-          if (c.high >= slPrice) { exitReason = 'SL'; exitPrice = slPrice; }
-          else if (c.low <= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; }
+        // Later strategy candles: use fast strategy-TF OHLC when only one exit
+        // level is reachable. If BOTH SL and TP are reachable in the same candle,
+        // resolve their order with that candle's 1m candles chronologically.
+        const slTouched = tradeDir === 'long' ? c.low <= slPrice : c.high >= slPrice;
+        const tpTouched = tradeDir === 'long' ? c.high >= tpPrice : c.low <= tpPrice;
+
+        if (slTouched && tpTouched) {
+          const mins = oneMinuteByParent.get(c.time) || [];
+
+          // Only use 1m ordering when the complete strategy-candle minute set is
+          // available. If it is incomplete, keep the deterministic conservative
+          // fallback (SL first) rather than inventing a favorable sequence.
+          const expectedMinutes = Math.max(1, Math.round(parentSec / 60));
+          const completeMinutes = mins.length >= expectedMinutes;
+
+          if (completeMinutes) {
+            for (const m of mins) {
+              const minuteSL = tradeDir === 'long' ? m.low <= slPrice : m.high >= slPrice;
+              const minuteTP = tradeDir === 'long' ? m.high >= tpPrice : m.low <= tpPrice;
+
+              // If both occur inside the SAME 1m candle, their intraminute order
+              // is unknowable from OHLC, so SL wins by the agreed conservative rule.
+              if (minuteSL && minuteTP) {
+                exitReason = 'SL'; exitPrice = slPrice; exitAt = m.time; break;
+              }
+              if (minuteSL) {
+                exitReason = 'SL'; exitPrice = slPrice; exitAt = m.time; break;
+              }
+              if (minuteTP) {
+                exitReason = 'TP'; exitPrice = tpPrice; exitAt = m.time; break;
+              }
+            }
+          }
+
+          // A 5m candle says both levels were touched but its 1m set is incomplete
+          // or inconsistent. Use the conservative SL-first fallback.
+          if (!exitReason) {
+            exitReason = 'SL'; exitPrice = slPrice; exitAt = c.time;
+          }
+        } else if (slTouched) {
+          exitReason = 'SL'; exitPrice = slPrice; exitAt = c.time;
+        } else if (tpTouched) {
+          exitReason = 'TP'; exitPrice = tpPrice; exitAt = c.time;
         }
-        if (exitReason) exitAt = c.time;
       }
 
       if (exitReason) {
@@ -817,6 +893,7 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
         const gstCharge = brokerCharge * (p.gstPct / 100);
         const totalCharges = brokerCharge + gstCharge;
         const netPnL = grossPnL - totalCharges;
+        const equityBeforeExit = equity;
         equity += netPnL;
         peak = Math.max(peak, equity);
         const dd = peak > 0 ? (peak - equity) / peak * 100 : 0;
@@ -831,7 +908,7 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
 
         const netR = riskAmount > 0 ? netPnL / riskAmount : 0;
         const stopPct = entryPrice > 0 ? (slDistance / entryPrice) * 100 : 0;
-        const effectiveLeverage = equity > 0 ? entryNotional / Math.max(equity - netPnL, 0.0000001) : 0;
+        const effectiveLeverage = equityBeforeExit > 0 ? entryNotional / equityBeforeExit : 0;
         const feeRiskPct = riskAmount > 0 ? (totalCharges / riskAmount) * 100 : 0;
 
         trades.push({
@@ -843,6 +920,7 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
         });
         equityCurve.push({ time: exitAt, equity });
         inTrade = false; tradeDir = null; entryBarIndex = null;
+        entryMinuteIndex = null; entryMinutes = null;
       }
     }
   }
@@ -890,6 +968,8 @@ function runBacktest(candles, p, oneMinuteCandles = []) {
       tradesSkippedTightStop,
       tradesSkippedLeverage,
       tradesSkippedFees,
+      entryAttemptsMissing1m,
+      entryAttempts1mMismatch,
     }
   };
 }
@@ -930,6 +1010,8 @@ function renderStats(stats) {
     ['Skipped: Stop Too Tight', stats.tradesSkippedTightStop, 'amber'],
     ['Skipped: Leverage Too High', stats.tradesSkippedLeverage, 'amber'],
     ['Skipped: Fees Too High', stats.tradesSkippedFees, 'amber'],
+    ['Entry Attempts: Missing 1M Data', stats.entryAttemptsMissing1m, 'amber'],
+    ['Entry Attempts: 5M/1M Mismatch', stats.entryAttempts1mMismatch, 'amber'],
   ];
   grid.innerHTML = cells.map(([label,val,cls]) =>
     `<div class="stat-cell"><div class="label">${label}</div><div class="value ${cls}">${val}</div></div>`
@@ -1256,6 +1338,9 @@ document.getElementById('optimizeBtn').addEventListener('click', async () => {
       }
     );
 
+    progressText.textContent = 'Indexing 1-minute execution candles once...';
+    const oneMinuteByParent = buildOneMinuteIndex(oneMinuteCandles, base.strategyResolutionSeconds);
+
     const largestEma = Math.max(...space.emaLen);
     const largestSlope = Math.max(...space.slopeLookback);
     if (candles.length < largestEma + largestSlope + 5) {
@@ -1270,7 +1355,7 @@ document.getElementById('optimizeBtn').addEventListener('click', async () => {
 
       const combo = comboFromIndex(space, indices[n]);
       const params = { ...base, ...combo };
-      const result = runBacktest(candles, params, oneMinuteCandles);
+      const result = runBacktest(candles, params, oneMinuteByParent);
 
       if (result.stats.totalTrades >= minTrades && result.stats.maxDD <= maxDDAllowed) {
         eligible.push({ params, stats: result.stats });
@@ -1378,10 +1463,13 @@ document.getElementById('runBtn').addEventListener('click', async () => {
       progressText.textContent = `Fetching 1m execution data... ${pct.toFixed(1)}% (${count.toLocaleString()} candles loaded)`;
     });
 
+    progressText.textContent = 'Indexing 1-minute execution candles once...';
+    const oneMinuteByParent = buildOneMinuteIndex(oneMinuteCandles, params.strategyResolutionSeconds);
+
     progressText.textContent = `Simulating strategy over ${candles.length.toLocaleString()} strategy candles with ${oneMinuteCandles.length.toLocaleString()} 1m execution candles...`;
     await new Promise(r => setTimeout(r, 30)); // let UI paint
 
-    const result = runBacktest(candles, params, oneMinuteCandles);
+    const result = runBacktest(candles, params, oneMinuteByParent);
 
     renderStats(result.stats);
     document.getElementById('equity-panel').style.display = 'block';
