@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>EMA Reclaim/Breakout Backtester — Live-Aligned</title>
+<title>EMA Reclaim/Breakout Backtester — 1M Execution</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -222,7 +222,7 @@
 <div class="wrap">
 
   <header>
-    <h1>BTCUSD<span> // LIVE-ALIGNED RECLAIM-BREAKOUT BACKTESTER</span></h1>
+    <h1>BTCUSD<span> // 5M SIGNAL · 1M EXECUTION BACKTESTER</span></h1>
     <div class="status-line"><span class="dot"></span>DATA SOURCE: DELTA EXCHANGE API</div>
   </header>
 
@@ -230,7 +230,7 @@
     <p class="panel-title">01 &nbsp;// &nbsp;Configuration</p>
     <p class="hint" style="margin-top:-4px;margin-bottom:14px;">
       <b>Live-aligned research mode:</b> signal conditions, pending-entry lifecycle and daily-loss behavior are aligned to the live bot rules.
-      Historical backtesting still assumes entry at the breakout trigger price; actual live market orders can fill differently because of slippage/latency.
+      Strategy signals remain on the selected timeframe. 1-minute candles are used only to resolve execution inside the entry candle; actual live market orders can still fill differently because of slippage/latency.
     </p>
     <div class="grid">
       <div>
@@ -328,9 +328,7 @@
       <b>Important:</b> the Results panel now records the exact RR, risk %, fee, GST, minimum stop,
       leverage cap and maximum fee/risk settings used in that backtest so different runs cannot be confused.
       <br><br>
-      <b>Live-parity note:</b> BUY-B uses low &lt;= EMA and SELL-B uses high &gt;= EMA; the signal candle (T0) cannot trigger its own breakout;
-      a valid pending setup is not cancelled simply because midnight passes. Same-candle post-entry SL/TP ordering cannot be reconstructed from parent OHLC alone,
-      so this standalone version begins protection evaluation from the next candle rather than using potentially pre-entry extremes.
+      <b>Intrabar execution:</b> BUY-B uses low &lt;= EMA and SELL-B uses high &gt;= EMA; T0 cannot self-trigger. When a later strategy candle breaks the trigger, its 1-minute candles are processed chronologically. The first 1m candle that breaks the trigger creates the entry at the trigger price. SL/TP are deliberately ignored on that same 1m entry candle; protection starts from the next 1m candle, including later 1m candles inside the same strategy candle. If a later 1m candle contains both SL and TP, SL wins.
     </p>
   </div>
 
@@ -494,7 +492,7 @@
     </div>
   </div>
 
-  <footer>LIVE-ALIGNED EMA RECLAIM/REJECTION BREAKOUT &nbsp;·&nbsp; T0 CANNOT SELF-TRIGGER &nbsp;·&nbsp; ENTRY = SIGNAL EXTREME BREAK &nbsp;·&nbsp; ONE POSITION AT A TIME</footer>
+  <footer>EMA RECLAIM/REJECTION BREAKOUT &nbsp;·&nbsp; STRATEGY TF SIGNALS &nbsp;·&nbsp; 1M INTRABAR EXECUTION &nbsp;·&nbsp; ONE POSITION AT A TIME</footer>
 </div>
 
 <script>
@@ -609,7 +607,16 @@ function computeEMA(closes, length) {
 // ============================================================
 // STRATEGY SIMULATION (aligned to the live bot rules used by this project)
 // ============================================================
-function runBacktest(candles, p) {
+function runBacktest(candles, p, oneMinuteCandles = []) {
+  // 1m candles are execution-only. They never create EMA signals.
+  const oneMinuteByParent = new Map();
+  const parentSec = p.strategyResolutionSeconds || 300;
+  for (const m of oneMinuteCandles) {
+    const parentTime = Math.floor(m.time / parentSec) * parentSec;
+    if (!oneMinuteByParent.has(parentTime)) oneMinuteByParent.set(parentTime, []);
+    oneMinuteByParent.get(parentTime).push(m);
+  }
+  for (const arr of oneMinuteByParent.values()) arr.sort((a,b) => a.time - b.time);
   const closes = candles.map(c => c.close);
   const ema = computeEMA(closes, p.emaLen);
   const warmup = p.emaLen + p.slopeLookback + 2;
@@ -713,6 +720,12 @@ function runBacktest(candles, p) {
         tpPrice = candidateTP;
         entryTime = c.time;
         entryBarIndex = i;
+
+        // Resolve the entry candle with 1m data. The 1m candle that first
+        // breaks the trigger creates the entry, but its own SL/TP range is ignored.
+        const mins = oneMinuteByParent.get(c.time) || [];
+        const entryMinuteIndex = mins.findIndex(m => m.high > candidateEntry);
+        if (entryMinuteIndex >= 0) entryTime = mins[entryMinuteIndex].time;
       }
 
       pendingBuyTrigger = null; pendingBuySL = null; pendingBuySignalIndex = null;
@@ -745,53 +758,75 @@ function runBacktest(candles, p) {
         tpPrice = candidateTP;
         entryTime = c.time;
         entryBarIndex = i;
+
+        // Resolve the entry candle with 1m data. The 1m candle that first
+        // breaks the trigger creates the entry, but its own SL/TP range is ignored.
+        const mins = oneMinuteByParent.get(c.time) || [];
+        const entryMinuteIndex = mins.findIndex(m => m.low < candidateEntry);
+        if (entryMinuteIndex >= 0) entryTime = mins[entryMinuteIndex].time;
       }
 
       pendingSellTrigger = null; pendingSellSL = null; pendingSellSignalIndex = null;
     }
 
-    // Historical OHLC cannot reveal whether this candle's low/high happened before or after
-    // the breakout. Never let pre-entry movement on the entry candle immediately stop/TP the trade.
-    // From the following candle onward, normal SL/TP simulation applies.
-    if (inTrade && (entryBarIndex == null || i > entryBarIndex)) {
-      let exitReason = null, exitPrice = null;
-      if (tradeDir === 'long') {
-        if (c.low <= slPrice) { exitReason = 'SL'; exitPrice = slPrice; }
-        else if (c.high >= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; }
-      } else {
-        if (c.high >= slPrice) { exitReason = 'SL'; exitPrice = slPrice; }
-        else if (c.low <= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; }
+    // Intrabar exit handling.
+    // On the strategy entry candle, use 1m candles and begin protection from
+    // the minute AFTER the entry minute. On later strategy candles, preserve
+    // the original conservative SL-first OHLC behavior.
+    if (inTrade) {
+      let exitReason = null, exitPrice = null, exitAt = null;
+
+      if (entryBarIndex === i) {
+        const mins = oneMinuteByParent.get(c.time) || [];
+        let entryMinuteIndex = -1;
+        if (tradeDir === 'long') entryMinuteIndex = mins.findIndex(m => m.high > entryPrice);
+        else entryMinuteIndex = mins.findIndex(m => m.low < entryPrice);
+
+        if (entryMinuteIndex >= 0) {
+          for (let mi = entryMinuteIndex + 1; mi < mins.length; mi++) {
+            const m = mins[mi];
+            if (tradeDir === 'long') {
+              if (m.low <= slPrice) { exitReason = 'SL'; exitPrice = slPrice; exitAt = m.time; break; }
+              if (m.high >= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; exitAt = m.time; break; }
+            } else {
+              if (m.high >= slPrice) { exitReason = 'SL'; exitPrice = slPrice; exitAt = m.time; break; }
+              if (m.low <= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; exitAt = m.time; break; }
+            }
+          }
+        }
+      } else if (entryBarIndex == null || i > entryBarIndex) {
+        if (tradeDir === 'long') {
+          if (c.low <= slPrice) { exitReason = 'SL'; exitPrice = slPrice; }
+          else if (c.high >= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; }
+        } else {
+          if (c.high >= slPrice) { exitReason = 'SL'; exitPrice = slPrice; }
+          else if (c.low <= tpPrice) { exitReason = 'TP'; exitPrice = tpPrice; }
+        }
+        if (exitReason) exitAt = c.time;
       }
+
       if (exitReason) {
         const rMultiple = exitReason === 'TP' ? p.rr : -1;
         const riskAmount = equity * (p.riskPct / 100);
         const grossPnL = rMultiple * riskAmount;
-
-        // Notional traded on each leg, sized off the risk amount and the SL distance —
-        // this is what broker charges are actually levied on (entry leg + exit leg).
         const slDistance = Math.abs(entryPrice - slPrice);
         const positionQty = slDistance > 0 ? riskAmount / slDistance : 0;
         const entryNotional = positionQty * entryPrice;
         const exitNotional = positionQty * exitPrice;
-
         const brokerCharge = (entryNotional + exitNotional) * (p.commissionPct / 100);
         const gstCharge = brokerCharge * (p.gstPct / 100);
         const totalCharges = brokerCharge + gstCharge;
-
         const netPnL = grossPnL - totalCharges;
         equity += netPnL;
         peak = Math.max(peak, equity);
         const dd = peak > 0 ? (peak - equity) / peak * 100 : 0;
         if (dd > maxDD) maxDD = dd;
 
-        // --- Update the daily consecutive-loss streak ---
         if (exitReason === 'SL') {
           dailyLossStreak++;
-          if (dailyLossStreak >= p.maxLossesPerDay) {
-            dayBlocked = true;
-          }
+          if (dailyLossStreak >= p.maxLossesPerDay) dayBlocked = true;
         } else {
-          dailyLossStreak = 0; // a win resets the streak, trading continues
+          dailyLossStreak = 0;
         }
 
         const netR = riskAmount > 0 ? netPnL / riskAmount : 0;
@@ -801,12 +836,12 @@ function runBacktest(candles, p) {
 
         trades.push({
           direction: tradeDir, entryTime, entryPrice, slPrice, tpPrice,
-          exitTime: c.time, exitPrice, exitReason, rMultiple, netR,
+          exitTime: exitAt, exitPrice, exitReason, rMultiple, netR,
           grossPnL, brokerCharge, gstCharge, totalCharges, netPnL,
           stopPct, effectiveLeverage, feeRiskPct,
           equityAfter: equity, cumulativeNetProfit: equity - p.startCapital
         });
-        equityCurve.push({ time: c.time, equity });
+        equityCurve.push({ time: exitAt, equity });
         inTrade = false; tradeDir = null; entryBarIndex = null;
       }
     }
@@ -1022,6 +1057,7 @@ function readBaseParams() {
     minStopPct: parseFloat(document.getElementById('minStopPct').value),
     maxLeverage: parseFloat(document.getElementById('maxLeverage').value),
     maxFeeRiskPct: parseFloat(document.getElementById('maxFeeRiskPct').value),
+    strategyResolutionSeconds: resolutionToSeconds(document.getElementById('resolution').value),
   };
 }
 
@@ -1211,6 +1247,15 @@ document.getElementById('optimizeBtn').addEventListener('click', async () => {
       }
     );
 
+    progressText.textContent = 'Fetching 1-minute execution candles once for optimization...';
+    const oneMinuteCandles = await fetchCandles(
+      market.symbol, '1m', market.startUnix, market.endUnix,
+      (pct, count) => {
+        progressBar.style.width = (20 + pct * 0.20).toFixed(1) + '%';
+        progressText.textContent = `Fetching 1m execution data... ${pct.toFixed(1)}% (${count.toLocaleString()} candles)`;
+      }
+    );
+
     const largestEma = Math.max(...space.emaLen);
     const largestSlope = Math.max(...space.slopeLookback);
     if (candles.length < largestEma + largestSlope + 5) {
@@ -1225,15 +1270,15 @@ document.getElementById('optimizeBtn').addEventListener('click', async () => {
 
       const combo = comboFromIndex(space, indices[n]);
       const params = { ...base, ...combo };
-      const result = runBacktest(candles, params);
+      const result = runBacktest(candles, params, oneMinuteCandles);
 
       if (result.stats.totalTrades >= minTrades && result.stats.maxDD <= maxDDAllowed) {
         eligible.push({ params, stats: result.stats });
       }
 
       if (n % 10 === 0 || n === indices.length - 1) {
-        const simPct = ((n + 1) / indices.length) * 80;
-        progressBar.style.width = (20 + simPct).toFixed(1) + '%';
+        const simPct = ((n + 1) / indices.length) * 60;
+        progressBar.style.width = (40 + simPct).toFixed(1) + '%';
         progressText.textContent =
           `Optimizing ${n+1}/${indices.length} trials · ${eligible.length} eligible · ` +
           `${totalPossible.toLocaleString()} possible combinations`;
@@ -1310,6 +1355,7 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     minStopPct: parseFloat(document.getElementById('minStopPct').value),
     maxLeverage: parseFloat(document.getElementById('maxLeverage').value),
     maxFeeRiskPct: parseFloat(document.getElementById('maxFeeRiskPct').value),
+    strategyResolutionSeconds: resolutionToSeconds(document.getElementById('resolution').value),
   };
 
   const progressBar = document.getElementById('progressBar');
@@ -1326,10 +1372,16 @@ document.getElementById('runBtn').addEventListener('click', async () => {
       throw new Error(`Only ${candles.length} candles returned — not enough for a ${params.emaLen}-period EMA. Try a wider date range.`);
     }
 
-    progressText.textContent = `Simulating strategy over ${candles.length.toLocaleString()} candles...`;
+    progressText.textContent = 'Fetching 1-minute candles for intrabar execution...';
+    const oneMinuteCandles = await fetchCandles(symbol, '1m', startUnix, endUnix, (pct, count) => {
+      progressBar.style.width = pct.toFixed(1) + '%';
+      progressText.textContent = `Fetching 1m execution data... ${pct.toFixed(1)}% (${count.toLocaleString()} candles loaded)`;
+    });
+
+    progressText.textContent = `Simulating strategy over ${candles.length.toLocaleString()} strategy candles with ${oneMinuteCandles.length.toLocaleString()} 1m execution candles...`;
     await new Promise(r => setTimeout(r, 30)); // let UI paint
 
-    const result = runBacktest(candles, params);
+    const result = runBacktest(candles, params, oneMinuteCandles);
 
     renderStats(result.stats);
     document.getElementById('equity-panel').style.display = 'block';
